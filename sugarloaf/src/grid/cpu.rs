@@ -161,6 +161,11 @@ impl CpuGridAtlas {
         true
     }
 
+    pub fn clear(&mut self) {
+        self.allocator.clear();
+        self.slots.clear();
+    }
+
     #[inline]
     pub fn pixels(&self) -> &[u8] {
         &self.pixels
@@ -266,18 +271,33 @@ impl CpuGridRenderer {
         self.atlas_grayscale.lookup(key)
     }
 
+    /// Drop every cached glyph and force a full rebuild. Called when
+    /// the font library is swapped, since the new library reuses font ids.
+    pub fn clear_atlas(&mut self) {
+        self.atlas_grayscale.clear();
+        self.atlas_color.clear();
+        self.needs_full_rebuild = true;
+    }
+
     pub fn insert_glyph(
         &mut self,
         key: GlyphKey,
         glyph: RasterizedGlyph<'_>,
     ) -> Option<AtlasSlot> {
-        if let Some(slot) = self.atlas_grayscale.insert(key, glyph) {
-            return Some(slot);
-        }
-        if self.atlas_grayscale.grow() {
-            self.atlas_grayscale.insert(key, glyph)
-        } else {
-            None
+        let mut cleared = false;
+        loop {
+            if let Some(slot) = self.atlas_grayscale.insert(key, glyph) {
+                return Some(slot);
+            }
+            if self.atlas_grayscale.grow() {
+                continue;
+            }
+            if cleared {
+                return None;
+            }
+            self.atlas_grayscale.clear();
+            self.needs_full_rebuild = true;
+            cleared = true;
         }
     }
 
@@ -291,13 +311,20 @@ impl CpuGridRenderer {
         key: GlyphKey,
         glyph: RasterizedGlyph<'_>,
     ) -> Option<AtlasSlot> {
-        if let Some(slot) = self.atlas_color.insert(key, glyph) {
-            return Some(slot);
-        }
-        if self.atlas_color.grow() {
-            self.atlas_color.insert(key, glyph)
-        } else {
-            None
+        let mut cleared = false;
+        loop {
+            if let Some(slot) = self.atlas_color.insert(key, glyph) {
+                return Some(slot);
+            }
+            if self.atlas_color.grow() {
+                continue;
+            }
+            if cleared {
+                return None;
+            }
+            self.atlas_color.clear();
+            self.needs_full_rebuild = true;
+            cleared = true;
         }
     }
 
@@ -309,6 +336,14 @@ impl CpuGridRenderer {
     #[inline]
     pub fn mark_full_rebuild_done(&mut self) {
         self.needs_full_rebuild = false;
+    }
+
+    /// Force the next frame to rebuild every row, even when nothing dirtied
+    /// the cells. Used when state outside the grid (e.g. the color theme)
+    /// changed and every cell must re-resolve.
+    #[inline]
+    pub fn request_full_rebuild(&mut self) {
+        self.needs_full_rebuild = true;
     }
 
     /// Hash all state that affects what `render` will paint. The CPU
@@ -505,31 +540,7 @@ fn premul(c: [u8; 4]) -> [u8; 4] {
     ]
 }
 
-#[inline]
-fn pack_opaque(r: u8, g: u8, b: u8) -> u32 {
-    ((r as u32) << 16) | ((g as u32) << 8) | (b as u32)
-}
-
-/// Premultiplied source-over against a 0x00RRGGBB destination.
-#[inline]
-fn blend_over(src: [u8; 4], dst: u32) -> u32 {
-    let sa = src[3] as u32;
-    if sa == 0 {
-        return dst;
-    }
-    if sa == 255 {
-        return pack_opaque(src[0], src[1], src[2]);
-    }
-    let inv = 255 - sa;
-    let dr = (dst >> 16) & 0xff;
-    let dg = (dst >> 8) & 0xff;
-    let db = dst & 0xff;
-    // src is already premultiplied — add to attenuated dst.
-    let or = src[0] as u32 + (dr * inv + 127) / 255;
-    let og = src[1] as u32 + (dg * inv + 127) / 255;
-    let ob = src[2] as u32 + (db * inv + 127) / 255;
-    pack_opaque(or.min(255) as u8, og.min(255) as u8, ob.min(255) as u8)
-}
+use crate::premul::{blend_premul_over as blend_over, pack_opaque};
 
 #[allow(clippy::too_many_arguments)]
 fn fill_rect(

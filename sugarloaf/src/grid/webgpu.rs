@@ -144,7 +144,6 @@ impl WgpuGlyphAtlas {
         Some(slot)
     }
 
-    #[allow(dead_code)]
     pub fn clear(&mut self) {
         self.allocator.clear();
         self.slots.clear();
@@ -306,6 +305,11 @@ impl WgpuGridRenderer {
         self.needs_full_rebuild = false;
     }
 
+    #[inline]
+    pub fn request_full_rebuild(&mut self) {
+        self.needs_full_rebuild = true;
+    }
+
     pub fn resize(&mut self, cols: u32, rows: u32) {
         if cols == self.cols && rows == self.rows {
             return;
@@ -405,11 +409,29 @@ impl WgpuGridRenderer {
         self.atlas_color.lookup(key)
     }
 
+    /// Drop every cached glyph and force a full rebuild. Called when
+    /// the font library is swapped, since the new library reuses font ids.
+    pub fn clear_atlas(&mut self) {
+        self.atlas_grayscale.clear();
+        self.atlas_color.clear();
+        self.needs_full_rebuild = true;
+        self.fg_dirty = true;
+        self.bg_dirty = true;
+    }
+
+    /// The wgpu atlas is fixed-size (no grow yet), so on atlas-full
+    /// clear it once and rebuild every row.
     pub fn insert_glyph(
         &mut self,
         key: GlyphKey,
         glyph: RasterizedGlyph<'_>,
     ) -> Option<AtlasSlot> {
+        if let Some(slot) = self.atlas_grayscale.insert(key, glyph) {
+            return Some(slot);
+        }
+        self.atlas_grayscale.clear();
+        self.needs_full_rebuild = true;
+        self.fg_dirty = true;
         self.atlas_grayscale.insert(key, glyph)
     }
 
@@ -418,6 +440,12 @@ impl WgpuGridRenderer {
         key: GlyphKey,
         glyph: RasterizedGlyph<'_>,
     ) -> Option<AtlasSlot> {
+        if let Some(slot) = self.atlas_color.insert(key, glyph) {
+            return Some(slot);
+        }
+        self.atlas_color.clear();
+        self.needs_full_rebuild = true;
+        self.fg_dirty = true;
         self.atlas_color.insert(key, glyph)
     }
 

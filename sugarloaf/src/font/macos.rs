@@ -29,10 +29,11 @@ use core_text::{
     font::{CTFont, CTFontRef},
     font_collection,
     font_descriptor::{
-        self, kCTFontBoldTrait, kCTFontFamilyNameAttribute, kCTFontItalicTrait,
-        kCTFontMonoSpaceTrait, kCTFontOrientationDefault, kCTFontStyleNameAttribute,
-        kCTFontSymbolicTrait, kCTFontTraitsAttribute, kCTFontVariationAttribute,
-        CTFontDescriptor, CTFontDescriptorCopyAttribute, CTFontDescriptorRef,
+        self, kCTFontBoldTrait, kCTFontFamilyNameAttribute,
+        kCTFontFeatureSettingsAttribute, kCTFontItalicTrait, kCTFontMonoSpaceTrait,
+        kCTFontOrientationDefault, kCTFontStyleNameAttribute, kCTFontSymbolicTrait,
+        kCTFontTraitsAttribute, kCTFontVariationAttribute, CTFontDescriptor,
+        CTFontDescriptorCopyAttribute, CTFontDescriptorRef,
     },
     font_manager,
     line::CTLine,
@@ -300,8 +301,7 @@ impl FontHandle {
 
     /// Return a derived `FontHandle` with the `wght` variation axis pinned
     /// to `value`. Used to bake the bold weight into Rio's bold/bold-italic
-    /// fallback slots from a single variable-font file (matches ghostty's
-    /// `Face.setVariations` flow in `face/coretext.zig:225-254`).
+    /// fallback slots from a single variable-font file.
     ///
     /// The returned CTFont references the same underlying font data — only
     /// the descriptor's variation attributes change. Returns `None` if
@@ -324,6 +324,68 @@ impl FontHandle {
             unsafe { CFString::wrap_under_get_rule(kCTFontVariationAttribute) };
         let attrs: CFDictionary<CFString, CFType> =
             CFDictionary::from_CFType_pairs(&[(var_attr_key, variation.as_CFType())]);
+        let desc = font_descriptor::new_from_attributes(&attrs);
+
+        let derived_ref = unsafe {
+            CTFontCreateCopyWithAttributes(
+                self.base_font.as_concrete_TypeRef(),
+                0.0,
+                std::ptr::null(),
+                desc.as_concrete_TypeRef(),
+            )
+        };
+        if derived_ref.is_null() {
+            return None;
+        }
+        let derived = unsafe { CTFont::wrap_under_create_rule(derived_ref) };
+        Some(Self { base_font: derived })
+    }
+
+    /// Return a derived `FontHandle` with OpenType feature settings
+    /// applied through `kCTFontFeatureSettingsAttribute`. Each entry is
+    /// a `(tag, value)` pair, e.g. `(u32::from_be_bytes(*b"liga"), 0)`
+    /// to disable standard ligatures. CoreText applies these to both
+    /// shaping and rasterization for the derived font.
+    pub fn with_features(self, features: &[(u32, u16)]) -> Option<Self> {
+        use core_foundation::array::CFArray;
+        use core_foundation::base::TCFType;
+        use core_foundation::dictionary::CFDictionary;
+        use core_foundation::number::CFNumber;
+        use core_foundation::string::CFString;
+
+        if features.is_empty() {
+            return Some(self);
+        }
+
+        extern "C" {
+            static kCTFontOpenTypeFeatureTag: core_foundation::string::CFStringRef;
+            static kCTFontOpenTypeFeatureValue: core_foundation::string::CFStringRef;
+        }
+
+        let tag_key = unsafe { CFString::wrap_under_get_rule(kCTFontOpenTypeFeatureTag) };
+        let value_key =
+            unsafe { CFString::wrap_under_get_rule(kCTFontOpenTypeFeatureValue) };
+
+        let entries: Vec<CFDictionary<CFString, CFType>> = features
+            .iter()
+            .filter_map(|(tag, value)| {
+                let bytes = tag.to_be_bytes();
+                let name = std::str::from_utf8(&bytes).ok()?;
+                Some(CFDictionary::from_CFType_pairs(&[
+                    (tag_key.clone(), CFString::new(name).as_CFType()),
+                    (value_key.clone(), CFNumber::from(*value as i64).as_CFType()),
+                ]))
+            })
+            .collect();
+        if entries.is_empty() {
+            return Some(self);
+        }
+        let settings = CFArray::from_CFTypes(&entries);
+
+        let attr_key =
+            unsafe { CFString::wrap_under_get_rule(kCTFontFeatureSettingsAttribute) };
+        let attrs: CFDictionary<CFString, CFType> =
+            CFDictionary::from_CFType_pairs(&[(attr_key, settings.as_CFType())]);
         let desc = font_descriptor::new_from_attributes(&attrs);
 
         let derived_ref = unsafe {
@@ -555,6 +617,18 @@ pub fn find_font_path(
     italic: bool,
     style_name: Option<&str>,
 ) -> Option<PathBuf> {
+    find_font(family, bold, italic, style_name).and_then(|(path, _)| path)
+}
+
+/// Preserve the matched face, including its variable axes and collection
+/// index. The path is `None` for faces without an accessible file URL;
+/// the handle alone is enough to shape and rasterize them.
+pub fn find_font(
+    family: &str,
+    bold: bool,
+    italic: bool,
+    style_name: Option<&str>,
+) -> Option<(Option<PathBuf>, FontHandle)> {
     use core_foundation::array::CFArray;
 
     let family_cf = CFString::new(family);
@@ -609,10 +683,11 @@ pub fn find_font_path(
 
     let desired_styles = derive_desired_styles(bold, italic, style_name);
 
-    candidates
+    let descriptor = candidates
         .iter()
-        .max_by_key(|d| score_candidate(d, bold, italic, &desired_styles))
-        .and_then(|d| d.font_path())
+        .max_by_key(|d| score_candidate(d, bold, italic, &desired_styles))?;
+    let base_font = ct_font::new_from_descriptor(&descriptor, 1.0);
+    Some((descriptor.font_path(), FontHandle { base_font }))
 }
 
 fn derive_desired_styles(
@@ -822,7 +897,7 @@ pub fn all_families() -> Vec<String> {
 /// Swap B and R in each 4-byte pixel. CoreGraphics' `premul_first +
 /// byte_order_32_little` writes BGRA; Rio's atlas is RGBA. Alpha stays put.
 fn bgra_to_rgba_in_place(bytes: &mut [u8]) {
-    for px in bytes.chunks_exact_mut(4) {
+    for px in bytes.as_chunks_mut::<4>().0 {
         px.swap(0, 2);
     }
 }
@@ -1353,8 +1428,7 @@ fn build_utf16_to_utf8_map(text: &str) -> Vec<usize> {
 /// `CFStringCreateWithCharactersNoCopy`, and `ShapedGlyph.cluster`
 /// comes back as a UTF-16 code-unit offset. Skips the UTF-8 → UTF-16
 /// conversion inside `CFString::new` AND the UTF-16 → UTF-8 mapping
-/// pass after CoreText. CoreText shaper at
-/// `ghostty/src/font/shaper/coretext.zig:652-680`.
+/// pass after CoreText.
 pub fn shape_text_utf16(
     handle: &FontHandle,
     utf16: &[u16],

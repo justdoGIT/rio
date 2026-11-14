@@ -1,7 +1,10 @@
 pub mod constants;
 pub mod fonts;
-pub mod glyf_decode;
-pub mod glyph_registry;
+// The glyph-protocol decoder + registry moved to the `rio-graphics` leaf
+// crate so the terminal core can use them without depending on sugarloaf.
+// Re-exported here so `sugarloaf::font::glyf_decode` /
+// `sugarloaf::font::glyph_registry` keep resolving.
+pub use rio_graphics::glyph::{glyf_decode, glyph_registry};
 #[cfg(all(unix, not(target_os = "macos"), not(target_os = "android")))]
 pub mod linux;
 #[cfg(not(target_arch = "wasm32"))]
@@ -9,7 +12,9 @@ pub mod loader;
 #[cfg(target_os = "macos")]
 pub mod macos;
 pub mod metrics;
-pub mod nerd_font_attributes;
+// Lives in rio-fonts so librio's CPU renderers share the same table;
+// re-exported here to keep the sugarloaf-internal path stable.
+pub use rio_fonts::nerd_font as nerd_font_attributes;
 pub mod text_run_cache;
 #[cfg(target_os = "windows")]
 pub mod windows;
@@ -18,6 +23,10 @@ pub mod windows;
 mod cjk_metrics_tests;
 
 pub const FONT_ID_REGULAR: usize = 0;
+// Style slot ids fixed by `FontLibraryData::load`'s insertion order.
+pub const FONT_ID_ITALIC: usize = 1;
+pub const FONT_ID_BOLD: usize = 2;
+pub const FONT_ID_BOLD_ITALIC: usize = 3;
 
 use crate::font::constants::*;
 use crate::font::fonts::{parse_unicode, FontStyle};
@@ -40,7 +49,7 @@ use swash::{tag_from_bytes, CacheKey, FontRef, Synthesis};
 pub use swash::{Style, Weight};
 
 /// Which font face slot a spec is being resolved for. Drives bold/italic
-/// trait selection (Ghostty-style), so the user's spec doesn't need to
+/// trait selection, so the user's spec doesn't need to
 /// carry a CSS weight number — the slot itself encodes intent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Slot {
@@ -88,12 +97,90 @@ pub struct LookupAttrs {
     pub bold: bool,
 }
 
+/// Whether the font registered under `font_id` carries a glyph for
+/// every codepoint in `cluster`.
+fn cluster_covered(
+    cluster: &mut CharCluster,
+    library: &FontLibraryData,
+    font_id: usize,
+    font: &FontData,
+) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        // Ask the CTFont directly whether it carries a glyph for each
+        // codepoint. Avoids the `get_data` byte load, so the fallback
+        // walk no longer touches the font file(s) at all.
+        let _ = (library, font_id);
+        let handle_opt = if let Some(handle) = font.handle() {
+            Some(handle.clone())
+        } else if let Some(path) = &font.path {
+            crate::font::macos::FontHandle::from_path(path)
+        } else if let Some(bytes) = &font.data {
+            crate::font::macos::FontHandle::from_bytes(bytes.as_ref())
+        } else {
+            None
+        };
+        if let Some(handle) = handle_opt {
+            let status = cluster.map(|ch| {
+                // Non-zero u16 == "has glyph"; swash's cluster.map only
+                // distinguishes zero vs non-zero, so `1` is fine as a
+                // placeholder when CTFont carries the codepoint.
+                if crate::font::macos::font_has_char(&handle, ch) {
+                    1
+                } else {
+                    0
+                }
+            });
+            status != Status::Discard
+        } else {
+            false
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = font;
+        if let Some((shared_data, offset, key)) = library.get_data(&font_id) {
+            let font_ref = FontRef {
+                data: shared_data.as_ref(),
+                offset,
+                key,
+            };
+            let charmap = font_ref.charmap();
+            let status = cluster.map(|ch| charmap.map(ch));
+            status != Status::Discard
+        } else {
+            false
+        }
+    }
+}
+
 pub fn lookup_for_font_match(
     cluster: &mut CharCluster,
     synth: &mut Synthesis,
     library: &FontLibraryData,
     spec: Option<LookupAttrs>,
 ) -> Option<(usize, bool)> {
+    // The configured slot for the requested style is authoritative
+    // whenever it covers the cluster. Fonts routinely ship bold as
+    // 600 or report styles the weight-based walk rejects, which used
+    // to send bold/italic cells to the regular face (#1110).
+    if let Some(spec) = spec {
+        let slot = match (spec.bold, spec.italic) {
+            (false, true) => FONT_ID_ITALIC,
+            (true, false) => FONT_ID_BOLD,
+            (true, true) => FONT_ID_BOLD_ITALIC,
+            (false, false) => FONT_ID_REGULAR,
+        };
+        let slot = library.resolve_id(slot);
+        if let Some(FontEntry::Owned(font)) = library.inner.get(&slot) {
+            if cluster_covered(cluster, library, slot, font) {
+                *synth = font.synth;
+                return Some((slot, font.is_emoji));
+            }
+        }
+    }
+
     let mut search_result = None;
 
     let fonts_len: usize = library.inner.len();
@@ -116,52 +203,7 @@ pub fn lookup_for_font_match(
             }
         }
 
-        #[cfg(target_os = "macos")]
-        let matched = {
-            // Ask the CTFont directly whether it carries a glyph for each
-            // codepoint. Avoids the `get_data` byte load — the fallback
-            // walk no longer touches the font file(s) at all.
-            let handle_opt = if let Some(path) = &font.path {
-                crate::font::macos::FontHandle::from_path(path)
-            } else if let Some(bytes) = &font.data {
-                crate::font::macos::FontHandle::from_bytes(bytes.as_ref())
-            } else {
-                None
-            };
-            if let Some(handle) = handle_opt {
-                let status = cluster.map(|ch| {
-                    // Non-zero u16 == "has glyph"; swash's cluster.map only
-                    // distinguishes zero vs non-zero, so `1` is fine as a
-                    // placeholder when CTFont carries the codepoint.
-                    if crate::font::macos::font_has_char(&handle, ch) {
-                        1
-                    } else {
-                        0
-                    }
-                });
-                status != Status::Discard
-            } else {
-                false
-            }
-        };
-
-        #[cfg(not(target_os = "macos"))]
-        let matched = {
-            if let Some((shared_data, offset, key)) = library.get_data(&font_id) {
-                let font_ref = FontRef {
-                    data: shared_data.as_ref(),
-                    offset,
-                    key,
-                };
-                let charmap = font_ref.charmap();
-                let status = cluster.map(|ch| charmap.map(ch));
-                status != Status::Discard
-            } else {
-                false
-            }
-        };
-
-        if matched {
+        if cluster_covered(cluster, library, font_id, font) {
             *synth = font_synth;
             search_result = Some((font_id, is_emoji));
             break;
@@ -503,7 +545,7 @@ pub struct SymbolMap {
 
 /// Per-slot entry in the font library. `Owned` holds an actual
 /// `FontData`; `Alias` redirects to another id whose `Owned` entry
-/// the slot should reuse. Mirrors Ghostty's `EntryOrAlias` so that a
+/// the slot should reuse, so that a
 /// missing italic/bold variant doesn't have to clone the regular
 /// face — the `metrics_cache`, `path`, `postscript_name`, etc. all
 /// stay single-instance.
@@ -533,6 +575,9 @@ pub struct FontLibraryData {
     pub inner: FxHashMap<usize, FontEntry>,
     pub symbol_maps: Option<Vec<SymbolMap>>,
     pub hinting: bool,
+    /// Parsed `fonts.features` entries, applied at shape time on every
+    /// platform. Empty when the user set none.
+    pub features: Arc<Vec<swash::Setting<u16>>>,
     // Cache primary font metrics for consistent cell dimensions (consistent metrics approach)
     primary_metrics_cache: FxHashMap<u32, Metrics>,
     /// PostScript-name → `font_id` lookup, populated on `insert`. Used
@@ -557,6 +602,7 @@ impl Default for FontLibraryData {
         Self {
             inner: FxHashMap::default(),
             hinting: true,
+            features: Arc::new(Vec::new()),
             symbol_maps: None,
             primary_metrics_cache: FxHashMap::default(),
             postscript_to_id: FxHashMap::default(),
@@ -841,6 +887,12 @@ impl FontLibraryData {
     pub fn load(&mut self, mut spec: SugarloafFonts) -> Vec<SugarloafFont> {
         // Configure hinting through spec
         self.hinting = spec.hinting;
+        self.features = Arc::new(
+            spec.features
+                .as_deref()
+                .map(parse_font_features)
+                .unwrap_or_default(),
+        );
 
         let mut fonts_not_fount: Vec<SugarloafFont> = vec![];
 
@@ -942,7 +994,9 @@ impl FontLibraryData {
         #[cfg(target_os = "macos")]
         {
             let primary_handle = self.try_get(&FONT_ID_REGULAR).and_then(|f| {
-                if let Some(path) = &f.path {
+                if let Some(handle) = f.handle() {
+                    Some(handle.clone())
+                } else if let Some(path) = &f.path {
                     crate::font::macos::FontHandle::from_path(path)
                 } else if let Some(bytes) = &f.data {
                     crate::font::macos::FontHandle::from_bytes(bytes.as_ref())
@@ -1298,6 +1352,8 @@ impl FontData {
             .map(|m| m.for_rich_text())
     }
 
+    /// `face_index` addresses a face inside a TTC/OTC collection;
+    /// parsing index 0 would load whichever face sits first.
     #[inline]
     pub fn from_data(
         data: SharedData,
@@ -1305,26 +1361,34 @@ impl FontData {
         evictable: bool,
         slot: Slot,
         font_spec: &SugarloafFont,
+        face_index: u32,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let font = FontRef::from_index(&data, 0)
+        let font = FontRef::from_index(&data, face_index as usize)
             .ok_or_else(|| format!("Failed to load font from path: {:?}", path))?;
         let (offset, key) = (font.offset, font.key);
 
         let attributes = font.attributes();
         let style = attributes.style();
-        let weight = attributes.weight();
+        // An explicit user weight pins the `wght` axis and overrides the
+        // face's reported weight so lookup and synthesis match intent.
+        let weight = match font_spec.weight {
+            Some(w) => Weight(w),
+            None => attributes.weight(),
+        };
 
+        // Semibold threshold: families shipping bold at 600 must not
+        // get faux-bold stacked on the real bold face.
         let (should_embolden, should_italicize) = synth_decisions(
             slot,
             font_spec,
-            weight >= Weight(700),
+            font_spec.weight.is_some() || weight >= Weight(600),
             style == Style::Italic,
         );
 
         let stretch = attributes.stretch();
         let synth = attributes.synthesize(attributes);
         let is_emoji = has_color_tables(&font);
-        let postscript_name = parse_postscript_name(&data);
+        let postscript_name = parse_postscript_name(&data, face_index);
 
         let data = (!evictable).then_some(data);
 
@@ -1333,7 +1397,7 @@ impl FontData {
             offset,
             should_italicize,
             should_embolden,
-            wght_variation: None,
+            wght_variation: font_spec.weight.map(f32::from),
             key,
             synth,
             style,
@@ -1408,6 +1472,25 @@ impl FontData {
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let handle = crate::font::macos::FontHandle::from_path(&path)
             .ok_or_else(|| format!("CoreText refused {}", path.display()))?;
+        Ok(Self::from_handle_macos(handle, Some(path), slot, font_spec))
+    }
+
+    #[cfg(target_os = "macos")]
+    fn from_handle_macos(
+        handle: crate::font::macos::FontHandle,
+        path: Option<PathBuf>,
+        slot: Slot,
+        font_spec: &SugarloafFont,
+    ) -> Self {
+        // Pin the `wght` axis when the user configured a weight so the
+        // stored CTFont shapes and rasterizes at that weight.
+        let handle = match font_spec.weight {
+            Some(w) => handle
+                .clone()
+                .with_wght_variation(f32::from(w))
+                .unwrap_or(handle),
+            None => handle,
+        };
         let attrs = crate::font::macos::font_attributes(&handle);
 
         let style = if attrs.is_italic {
@@ -1415,15 +1498,22 @@ impl FontData {
         } else {
             swash::Style::Normal
         };
-        let weight = swash::Weight(attrs.weight);
+        let weight = match font_spec.weight {
+            Some(w) => swash::Weight(w),
+            None => swash::Weight(attrs.weight),
+        };
 
-        let (should_embolden, should_italicize) =
-            synth_decisions(slot, font_spec, attrs.is_bold, attrs.is_italic);
+        let (should_embolden, should_italicize) = synth_decisions(
+            slot,
+            font_spec,
+            font_spec.weight.is_some() || attrs.is_bold,
+            attrs.is_italic,
+        );
 
         let postscript_name = Some(handle.postscript_name());
-        Ok(Self {
+        Self {
             data: None,
-            path: Some(path),
+            path,
             offset: 0,
             key: CacheKey::new(),
             weight,
@@ -1432,12 +1522,12 @@ impl FontData {
             synth: Synthesis::default(),
             should_embolden,
             should_italicize,
-            wght_variation: None,
+            wght_variation: font_spec.weight.map(f32::from),
             is_emoji: attrs.is_color,
             metrics_cache: FxHashMap::default(),
             handle: Some(handle),
             postscript_name,
-        })
+        }
     }
 
     /// Load a bundled font whose bytes live in `.rodata` (anything from
@@ -1455,8 +1545,8 @@ impl FontData {
     }
 
     /// Like [`from_static_slice`] but optionally bakes a `wght` axis
-    /// value into the loaded face. Mirrors ghostty's `Face.setVariations`
-    /// pattern: load the same variable-font bytes for every weight slot,
+    /// value into the loaded face: load the same variable-font bytes
+    /// for every weight slot,
     /// then set the `wght` axis post-construction so the rasterizer pulls
     /// the right outlines (regular vs. bold) from a single source file.
     ///
@@ -1481,7 +1571,7 @@ impl FontData {
         let stretch = attributes.stretch();
         let synth = attributes.synthesize(attributes);
         let is_emoji = has_color_tables(&font);
-        let postscript_name = parse_postscript_name(data);
+        let postscript_name = parse_postscript_name(data, 0);
 
         #[cfg(target_os = "macos")]
         let handle = {
@@ -1531,7 +1621,7 @@ impl FontData {
         let synth = attributes.synthesize(attributes);
         let is_emoji = has_color_tables(&font);
 
-        let postscript_name = parse_postscript_name(data);
+        let postscript_name = parse_postscript_name(data, 0);
         Ok(Self {
             data: Some(SharedData::new(data.to_vec())),
             offset,
@@ -1587,7 +1677,7 @@ impl FontData {
         let stretch = attributes.stretch();
         let synth = attributes.synthesize(attributes);
         let is_emoji = has_color_tables(&font);
-        let postscript_name = parse_postscript_name(&data);
+        let postscript_name = parse_postscript_name(&data, face_index);
 
         Ok(Self {
             data: Some(data),
@@ -1614,8 +1704,8 @@ impl FontData {
 /// without re-parsing. Falls back to the family name (ID 1) if the
 /// PS name is missing — a font without a usable name can't participate
 /// in the cascade-mapping anyway, so `None` is fine.
-fn parse_postscript_name(data: &[u8]) -> Option<String> {
-    let face = ttf_parser::Face::parse(data, 0).ok()?;
+fn parse_postscript_name(data: &[u8], face_index: u32) -> Option<String> {
+    let face = ttf_parser::Face::parse(data, face_index).ok()?;
     face.names()
         .into_iter()
         .find(|n| n.name_id == ttf_parser::name_id::POST_SCRIPT_NAME && n.is_unicode())
@@ -1648,6 +1738,417 @@ use tracing::{info, warn};
 enum FindResult {
     Found(FontData),
     NotFound(SugarloafFont),
+}
+
+/// Select a color bitmap that Swash can safely render for Rio's premultiplied
+/// RGBA atlas. Raw premultiplied strikes cannot pass through Swash's resampler.
+/// Only the non-macOS rasterizers call this, but it is compiled everywhere so
+/// its tests run on every platform.
+pub fn select_color_bitmap(
+    font: swash::FontRef<'_>,
+    glyph_id: u16,
+    size: f32,
+) -> Option<swash::scale::Source> {
+    use swash::scale::{Source, StrikeWith};
+    use swash::tag_from_bytes;
+
+    if font.table(tag_from_bytes(b"sbix")).is_some() {
+        return Some(Source::ColorBitmap(StrikeWith::BestFit));
+    }
+
+    // Follow Swash's strike and glyph-range selection exactly. Packed 32-bit
+    // CBDT records must be skipped: Swash allocates them as one-channel data
+    // and panics while decoding their four-byte pixels.
+    //
+    // Swash only activates these strikes when the data table is present
+    // too, so a CBLC-only font must not report a bitmap here.
+    font.table(tag_from_bytes(b"CBDT"))?;
+    let table = font.table(tag_from_bytes(b"CBLC"))?;
+    let read_u16 = |offset| {
+        table
+            .get(offset..)?
+            .get(..2)
+            .map(|bytes| u16::from_be_bytes(bytes.try_into().unwrap()))
+    };
+    let read_u32 = |offset| {
+        table
+            .get(offset..)?
+            .get(..4)
+            .map(|bytes| u32::from_be_bytes(bytes.try_into().unwrap()) as usize)
+    };
+    let mut selected = None;
+    for index in 0..read_u32(4)? {
+        let strike = 8usize.checked_add(index.checked_mul(48)?)?;
+        let first_glyph = read_u16(strike.checked_add(40)?)?;
+        let last_glyph = read_u16(strike.checked_add(42)?)?;
+        if !(first_glyph..=last_glyph).contains(&glyph_id) {
+            continue;
+        }
+        let array = read_u32(strike)?;
+        for subtable in 0..read_u32(strike.checked_add(8)?)? {
+            let entry = array.checked_add(subtable.checked_mul(8)?)?;
+            let first_glyph = read_u16(entry)?;
+            // Swash assumes subtable ranges are sorted and stops at the
+            // first one starting past the glyph. Mirror it, or a font with
+            // out-of-order ranges makes this guard approve a strike Swash
+            // skips — and render whatever unvetted strike Swash picks next.
+            if glyph_id < first_glyph {
+                break;
+            }
+            if (first_glyph..=read_u16(entry.checked_add(2)?)?).contains(&glyph_id) {
+                let subtable = array.checked_add(read_u32(entry.checked_add(4)?)?)?;
+                selected = Some((
+                    table.get(strike.checked_add(45)?).copied()?,
+                    table.get(strike.checked_add(46)?).copied()?,
+                    read_u16(subtable.checked_add(2)?)?,
+                ));
+                break;
+            }
+        }
+        if selected.is_some_and(|(ppem, _, _)| u16::from(ppem) >= size as u16) {
+            break;
+        }
+    }
+
+    match selected? {
+        (_, _, 17..=19) => Some(Source::ColorBitmap(StrikeWith::BestFit)),
+        (ppem, 32, 1 | 6) if size == f32::from(ppem) => {
+            Some(Source::ColorBitmap(StrikeWith::ExactSize))
+        }
+        (_, 32, 2 | 5 | 7) => None,
+        (_, bit_depth, format) => {
+            tracing::warn!(glyph_id, bit_depth, format, "unsupported color strike");
+            None
+        }
+    }
+}
+
+/// Normalize a bitmap selected by [`select_color_bitmap`] after Swash renders
+/// it. Color outlines are already premultiplied RGBA and remain unchanged.
+pub fn normalize_color_bitmap(image: &mut swash::scale::image::Image) {
+    use swash::scale::{Source, StrikeWith};
+
+    let png = match image.source {
+        Source::ColorBitmap(StrikeWith::BestFit) => true,
+        Source::ColorBitmap(StrikeWith::ExactSize) => false,
+        Source::ColorBitmap(mode) => {
+            tracing::error!(?mode, "unexpected Swash color bitmap selection mode");
+            return;
+        }
+        _ => return,
+    };
+    let byte_len = image.data.len();
+    let (pixels, remainder) = image.data.as_chunks_mut::<4>();
+    if !remainder.is_empty() {
+        tracing::error!(byte_len, "Swash color bitmap is not RGBA-aligned");
+        return;
+    }
+    for pixel in pixels {
+        if png {
+            let alpha = pixel[3] as u16;
+            for channel in &mut pixel[..3] {
+                *channel = ((*channel as u16 * alpha + 127) / 255) as u8;
+            }
+        } else {
+            pixel.swap(0, 2);
+        }
+    }
+}
+
+#[cfg(test)]
+mod color_bitmap_tests {
+    use super::{normalize_color_bitmap, select_color_bitmap};
+    use swash::scale::{image::Image, Source, StrikeWith};
+
+    #[test]
+    fn normalizes_png_and_raw_color_bitmaps() {
+        let mut png = Image::new();
+        png.source = Source::ColorBitmap(StrikeWith::BestFit);
+        png.data = vec![71, 112, 76, 0, 200, 100, 50, 128, 9, 8, 7, 255];
+        let mut bgra = png.clone();
+        bgra.source = Source::ColorBitmap(StrikeWith::ExactSize);
+        bgra.data = vec![25, 50, 100, 128, 7, 8, 9, 255];
+        let mut outline = bgra.clone();
+        outline.source = Source::ColorOutline(0);
+
+        normalize_color_bitmap(&mut png);
+        normalize_color_bitmap(&mut bgra);
+        normalize_color_bitmap(&mut outline);
+
+        assert_eq!(png.data, [0, 0, 0, 0, 100, 50, 25, 128, 9, 8, 7, 255]);
+        assert_eq!(bgra.data, [100, 50, 25, 128, 9, 8, 7, 255]);
+        assert_eq!(outline.data, [25, 50, 100, 128, 7, 8, 9, 255]);
+    }
+
+    #[test]
+    fn normalize_rejects_unaligned_data_untouched() {
+        let mut image = Image::new();
+        image.source = Source::ColorBitmap(StrikeWith::BestFit);
+        image.data = vec![10, 20, 30, 128, 40];
+        normalize_color_bitmap(&mut image);
+        assert_eq!(image.data, [10, 20, 30, 128, 40]);
+
+        let mut empty = Image::new();
+        empty.source = Source::ColorBitmap(StrikeWith::ExactSize);
+        normalize_color_bitmap(&mut empty);
+        assert!(empty.data.is_empty());
+    }
+
+    /// Assemble a minimal sfnt: magic + table directory (records must be
+    /// pre-sorted by tag; Swash binary-searches them) + table data.
+    fn build_font(tables: &[(&[u8; 4], Vec<u8>)]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&0x00010000u32.to_be_bytes());
+        out.extend_from_slice(&(tables.len() as u16).to_be_bytes());
+        out.extend_from_slice(&[0u8; 6]);
+        let mut offset = 12 + tables.len() * 16;
+        for (tag, data) in tables {
+            out.extend_from_slice(*tag);
+            out.extend_from_slice(&0u32.to_be_bytes());
+            out.extend_from_slice(&(offset as u32).to_be_bytes());
+            out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+            offset += data.len();
+        }
+        for (_, data) in tables {
+            out.extend_from_slice(data);
+        }
+        out
+    }
+
+    /// Assemble a CBLC table: one index subtable per strike, laid out
+    /// after the strike records. `strikes` entries are
+    /// `(ppem, bit_depth, image_format, first_glyph..=last_glyph)`.
+    fn build_cblc(strikes: &[(u8, u8, u16, std::ops::RangeInclusive<u16>)]) -> Vec<u8> {
+        let mut out = vec![0u8; 8 + strikes.len() * 48];
+        out[1] = 3; // majorVersion = 3
+        out[4..8].copy_from_slice(&(strikes.len() as u32).to_be_bytes());
+        for (i, (ppem, depth, format, glyphs)) in strikes.iter().enumerate() {
+            let strike = 8 + i * 48;
+            let array = out.len() as u32;
+            out[strike..strike + 4].copy_from_slice(&array.to_be_bytes());
+            out[strike + 8..strike + 12].copy_from_slice(&1u32.to_be_bytes());
+            out[strike + 40..strike + 42].copy_from_slice(&glyphs.start().to_be_bytes());
+            out[strike + 42..strike + 44].copy_from_slice(&glyphs.end().to_be_bytes());
+            out[strike + 44] = *ppem;
+            out[strike + 45] = *ppem;
+            out[strike + 46] = *depth;
+            // One indexSubTableArray entry, its subtable right behind it.
+            out.extend_from_slice(&glyphs.start().to_be_bytes());
+            out.extend_from_slice(&glyphs.end().to_be_bytes());
+            out.extend_from_slice(&8u32.to_be_bytes());
+            out.extend_from_slice(&1u16.to_be_bytes()); // indexFormat
+            out.extend_from_slice(&format.to_be_bytes()); // imageFormat
+            out.extend_from_slice(&0u32.to_be_bytes()); // imageDataOffset
+        }
+        out
+    }
+
+    /// Like [`build_cblc`], but each strike carries an explicit subtable
+    /// list `(first..=last, image_format)` in the given order, so tests can
+    /// model fonts whose subtable ranges are not sorted.
+    #[allow(clippy::type_complexity)]
+    fn build_cblc_multi(
+        strikes: &[(
+            u8,
+            u8,
+            std::ops::RangeInclusive<u16>,
+            &[(std::ops::RangeInclusive<u16>, u16)],
+        )],
+    ) -> Vec<u8> {
+        let mut out = vec![0u8; 8 + strikes.len() * 48];
+        out[1] = 3; // majorVersion = 3
+        out[4..8].copy_from_slice(&(strikes.len() as u32).to_be_bytes());
+        for (i, (ppem, depth, header, subtables)) in strikes.iter().enumerate() {
+            let strike = 8 + i * 48;
+            let array = out.len() as u32;
+            out[strike..strike + 4].copy_from_slice(&array.to_be_bytes());
+            out[strike + 8..strike + 12]
+                .copy_from_slice(&(subtables.len() as u32).to_be_bytes());
+            out[strike + 40..strike + 42].copy_from_slice(&header.start().to_be_bytes());
+            out[strike + 42..strike + 44].copy_from_slice(&header.end().to_be_bytes());
+            out[strike + 44] = *ppem;
+            out[strike + 45] = *ppem;
+            out[strike + 46] = *depth;
+            // All array entries first, their subheaders behind them.
+            let entries_len = (subtables.len() * 8) as u32;
+            for (j, (glyphs, _)) in subtables.iter().enumerate() {
+                out.extend_from_slice(&glyphs.start().to_be_bytes());
+                out.extend_from_slice(&glyphs.end().to_be_bytes());
+                out.extend_from_slice(&(entries_len + (j as u32) * 8).to_be_bytes());
+            }
+            for (_, format) in subtables.iter() {
+                out.extend_from_slice(&1u16.to_be_bytes()); // indexFormat
+                out.extend_from_slice(&format.to_be_bytes()); // imageFormat
+                out.extend_from_slice(&0u32.to_be_bytes()); // imageDataOffset
+            }
+        }
+        out
+    }
+
+    /// Wrap a CBLC table into a font that also carries the (empty) CBDT
+    /// data table Swash requires before it activates color strikes.
+    fn color_font(cblc: Vec<u8>) -> Vec<u8> {
+        build_font(&[(b"CBDT", vec![0u8; 4]), (b"CBLC", cblc)])
+    }
+
+    fn select(data: &[u8], glyph_id: u16, size: f32) -> Option<Source> {
+        let font = swash::FontRef::from_index(data, 0).expect("synthetic font parses");
+        select_color_bitmap(font, glyph_id, size)
+    }
+
+    #[test]
+    fn png_strikes_use_best_fit() {
+        let font = color_font(build_cblc(&[(128, 32, 17, 0..=10)]));
+        for size in [16.0, 128.0, 200.0] {
+            assert!(matches!(
+                select(&font, 5, size),
+                Some(Source::ColorBitmap(StrikeWith::BestFit))
+            ));
+        }
+    }
+
+    #[test]
+    fn raw_strikes_only_at_exact_size() {
+        let font = color_font(build_cblc(&[(64, 32, 1, 0..=10)]));
+        assert!(matches!(
+            select(&font, 5, 64.0),
+            Some(Source::ColorBitmap(StrikeWith::ExactSize))
+        ));
+        // Any other size would resample premultiplied BGRA; skip the bitmap.
+        assert!(select(&font, 5, 32.0).is_none());
+        assert!(select(&font, 5, 65.0).is_none());
+    }
+
+    #[test]
+    fn packed_strikes_are_skipped() {
+        // Formats 2, 5 and 7 make Swash under-allocate and panic on decode.
+        for format in [2u16, 5, 7] {
+            let font = color_font(build_cblc(&[(64, 32, format, 0..=10)]));
+            assert!(select(&font, 5, 64.0).is_none());
+        }
+    }
+
+    #[test]
+    fn glyph_outside_strike_range_finds_nothing() {
+        let font = color_font(build_cblc(&[(64, 32, 17, 4..=10)]));
+        assert!(select(&font, 3, 64.0).is_none());
+        assert!(select(&font, 11, 64.0).is_none());
+    }
+
+    #[test]
+    fn sbix_fonts_use_best_fit_without_cblc() {
+        let font = build_font(&[(b"sbix", vec![0u8; 8])]);
+        assert!(matches!(
+            select(&font, 5, 20.0),
+            Some(Source::ColorBitmap(StrikeWith::BestFit))
+        ));
+    }
+
+    /// Mirrors Swash's nearest-ppem walk: strikes are scanned in order and
+    /// the first one at or above the requested size wins, so the packed
+    /// small strike must not veto the PNG strike that Swash will render.
+    #[test]
+    fn nearest_strike_decides_the_format() {
+        let font = color_font(build_cblc(&[(32, 32, 5, 0..=10), (128, 32, 17, 0..=10)]));
+        assert!(matches!(
+            select(&font, 5, 40.0),
+            Some(Source::ColorBitmap(StrikeWith::BestFit))
+        ));
+        // At size <= 32 the packed strike is nearest: skip the bitmap.
+        assert!(select(&font, 5, 32.0).is_none());
+    }
+
+    #[test]
+    fn truncated_cblc_is_rejected_without_panicking() {
+        let mut cblc = build_cblc(&[(64, 32, 17, 0..=10)]);
+        for len in [0, 4, 8, 20, 50] {
+            cblc.truncate(len);
+            let font = color_font(cblc.clone());
+            assert!(select(&font, 5, 64.0).is_none());
+        }
+        // numSizes claiming more strikes than the data holds.
+        let mut lying = build_cblc(&[(64, 32, 17, 0..=10)]);
+        lying[4..8].copy_from_slice(&9u32.to_be_bytes());
+        let font = color_font(lying);
+        assert!(matches!(
+            select(&font, 5, 64.0),
+            Some(Source::ColorBitmap(StrikeWith::BestFit))
+        ));
+    }
+
+    /// Swash only activates CBLC strikes when CBDT is present too; a
+    /// CBLC-only font must not report a bitmap the renderer will never load.
+    #[test]
+    fn cblc_without_cbdt_is_ignored() {
+        let font = build_font(&[(b"CBLC", build_cblc(&[(64, 32, 17, 0..=10)]))]);
+        assert!(select(&font, 5, 64.0).is_none());
+    }
+
+    /// Swash assumes subtable ranges are sorted and treats a strike as not
+    /// covering a glyph the moment a range starts past it. A font with
+    /// out-of-order ranges must get the same answer here, or the guard
+    /// approves a PNG strike while Swash renders the packed strike behind
+    /// it — the exact panic this module exists to prevent.
+    #[test]
+    fn out_of_order_subtables_match_swash() {
+        let font = color_font(build_cblc_multi(&[
+            // Header covers 0..=10, but the subtable holding glyph 5 sits
+            // behind one starting at 8: Swash stops at 8 > 5 and skips
+            // this strike entirely.
+            (64, 32, 0..=10, &[(8..=10, 17), (0..=5, 17)]),
+            // ...falling through to this packed strike, which panics
+            // Swash's decoder if it is ever selected as a source.
+            (64, 32, 0..=10, &[(0..=10, 2)]),
+        ]));
+        assert!(select(&font, 5, 64.0).is_none());
+
+        // Sorted subtables keep working, including later entries.
+        let sorted = color_font(build_cblc_multi(&[(
+            64,
+            32,
+            0..=10,
+            &[(0..=3, 17), (4..=10, 17)],
+        )]));
+        assert!(matches!(
+            select(&sorted, 5, 64.0),
+            Some(Source::ColorBitmap(StrikeWith::BestFit))
+        ));
+    }
+}
+
+/// Parse `fonts.features` entries into OpenType feature settings.
+/// Accepts `"ss01"`, `"+ss01"`, `"-liga"` and `"cv01=2"` forms.
+pub fn parse_font_features(entries: &[String]) -> Vec<swash::Setting<u16>> {
+    let mut out: Vec<swash::Setting<u16>> = Vec::with_capacity(entries.len());
+    for raw in entries {
+        let s = raw.trim();
+        let (name, value) = if let Some(rest) = s.strip_prefix('-') {
+            (rest.trim(), 0u16)
+        } else if let Some(rest) = s.strip_prefix('+') {
+            (rest.trim(), 1u16)
+        } else if let Some((name, v)) = s.split_once('=') {
+            match v.trim().parse::<u16>() {
+                Ok(v) => (name.trim(), v),
+                Err(_) => {
+                    warn!("ignoring invalid font feature '{raw}'");
+                    continue;
+                }
+            }
+        } else {
+            (s, 1u16)
+        };
+        if name.is_empty() || name.len() > 4 || !name.is_ascii() {
+            warn!("ignoring invalid font feature '{raw}'");
+            continue;
+        }
+        let mut tag = [b' '; 4];
+        tag[..name.len()].copy_from_slice(name.as_bytes());
+        out.push(swash::Setting {
+            tag: u32::from_be_bytes(tag),
+            value,
+        });
+    }
+    out
 }
 
 /// Whether to apply faux-bold / faux-italic on top of the matched face.
@@ -1684,27 +2185,21 @@ fn find_font(font_spec: SugarloafFont, slot: Slot, evictable: bool) -> FindResul
         style_name
     );
 
-    let Some(path) =
-        crate::font::macos::find_font_path(&family, bold, italic, style_name)
+    let Some((path, handle)) =
+        crate::font::macos::find_font(&family, bold, italic, style_name)
     else {
         warn!("CoreText found no match for family='{family}'");
         return FindResult::NotFound(font_spec);
     };
 
-    // Path-based load: never reads bytes. `evictable` is ignored on the
-    // macOS path since `FontData.data` is always `None` here — there's
-    // nothing to evict.
+    // Retain the matched face; reopening its file loses named variable styles.
+    // CoreText owns the font data, so there are no bytes to evict here.
     let _ = evictable;
-    match FontData::from_path_macos(path.clone(), slot, &font_spec) {
-        Ok(d) => {
-            info!("Font '{family}' matched via CoreText at {}", path.display());
-            FindResult::Found(d)
-        }
-        Err(e) => {
-            warn!("Failed to open font '{family}' via CoreText: {e}");
-            FindResult::NotFound(font_spec)
-        }
+    match &path {
+        Some(p) => info!("Font '{family}' matched via CoreText at {}", p.display()),
+        None => info!("Font '{family}' matched via CoreText (no file path)"),
     }
+    FindResult::Found(FontData::from_handle_macos(handle, path, slot, &font_spec))
 }
 
 #[cfg(all(not(target_os = "macos"), not(target_arch = "wasm32")))]
@@ -1722,10 +2217,10 @@ fn find_font(
             ..crate::font::loader::Query::default()
         };
 
-        query.weight = if slot.is_bold() {
-            crate::font::loader::Weight::BOLD
-        } else {
-            crate::font::loader::Weight::NORMAL
+        query.weight = match font_spec.weight {
+            Some(w) => crate::font::loader::Weight(w),
+            None if slot.is_bold() => crate::font::loader::Weight::BOLD,
+            None => crate::font::loader::Weight::NORMAL,
         };
 
         query.style = if slot.is_italic() {
@@ -1742,7 +2237,7 @@ fn find_font(
         match db.query(&query) {
             Some(id) => {
                 match db.face_source(id) {
-                    Some((crate::font::loader::Source::File(ref path), _index)) => {
+                    Some((crate::font::loader::Source::File(ref path), index)) => {
                         // File source - load from path
                         if let Some(font_data_arc) =
                             load_from_font_source(&path.to_path_buf())
@@ -1753,6 +2248,7 @@ fn find_font(
                                 evictable,
                                 slot,
                                 &font_spec,
+                                index,
                             ) {
                                 Ok(d) => {
                                     tracing::info!(
@@ -1771,7 +2267,7 @@ fn find_font(
                             }
                         }
                     }
-                    Some((crate::font::loader::Source::Binary(font_data), _index)) => {
+                    Some((crate::font::loader::Source::Binary(font_data), index)) => {
                         // Binary source - use data directly
                         tracing::debug!(
                             "Using binary font data, {} bytes",
@@ -1784,6 +2280,7 @@ fn find_font(
                             evictable,
                             slot,
                             &font_spec,
+                            index,
                         ) {
                             Ok(d) => {
                                 tracing::info!("Font '{}' loaded from memory", family);
@@ -1812,8 +2309,7 @@ fn find_font(
 }
 
 /// Load a bundled fallback face for `slot` from the embedded Cascadia Code
-/// variable font. Mirrors ghostty's `SharedGridSet` setup (see
-/// `ghostty/src/font/SharedGridSet.zig:264-317`): regular and bold load
+/// variable font: regular and bold load
 /// the same upright variable file, italic and bold-italic load the same
 /// italic variable file, and the bold slots set the `wght` axis to 700.
 fn load_fallback_from_memory(slot: Slot) -> FontData {
@@ -1832,6 +2328,115 @@ fn load_fallback_from_memory(slot: Slot) -> FontData {
 #[cfg(test)]
 mod alias_tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn collection_face_coverage_and_advance_use_matched_handle() {
+        use crate::font::macos::{advance_units_for_char, font_has_char, FontHandle};
+        use crate::font_cache::compute_advance;
+
+        // Each table offset in a TTC is relative to the collection, not its face.
+        let mut collection = Vec::from(&b"ttcf\0\x01\0\0\0\0\0\x02"[..]);
+        collection.resize(20, 0);
+        for (index, bytes) in [
+            &include_bytes!(
+                "../../../rio-fonts/resources/SymbolsNerdFontMono/SymbolsNerdFontMono-Regular.ttf"
+            )[..],
+            constants::FONT_CASCADIA_CODE_NF,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            collection.resize((collection.len() + 3) & !3, 0);
+            let start = collection.len();
+            collection[12 + index * 4..16 + index * 4]
+                .copy_from_slice(&(start as u32).to_be_bytes());
+            collection.extend_from_slice(bytes);
+            let table_count = u16::from_be_bytes([bytes[4], bytes[5]]) as usize;
+            for table in 0..table_count {
+                let offset = start + 12 + table * 16 + 8;
+                let original = u32::from_be_bytes(
+                    collection[offset..offset + 4].try_into().unwrap(),
+                );
+                collection[offset..offset + 4]
+                    .copy_from_slice(&(original + start as u32).to_be_bytes());
+            }
+        }
+        let first = FontHandle::from_bytes_index(&collection, 0).expect("first face");
+        let matched = FontHandle::from_bytes_index(&collection, 1).expect("second face");
+        assert!(
+            !font_has_char(&first, 'M'),
+            "symbols face has no Latin glyph"
+        );
+        assert!(
+            font_has_char(&matched, 'M'),
+            "matched face has a Latin glyph"
+        );
+        let expected = advance_units_for_char(&matched, 'M').expect("matched advance");
+
+        // No file path: the handle alone must serve coverage and advances,
+        // like a matched system face without an accessible file URL.
+        let mut library = FontLibraryData::default();
+        library.insert(FontData::from_handle_macos(
+            matched,
+            None,
+            Slot::Regular,
+            &SugarloafFont::default(),
+        ));
+        let coverage =
+            library.find_best_font_match_strict('M', &SpanStyle::default(), None);
+        let advance = compute_advance(&library, FONT_ID_REGULAR, 'M');
+
+        assert_eq!(coverage, Some((FONT_ID_REGULAR, false)));
+        let advance = advance.expect("advance from the matched collection face");
+        assert_eq!(advance.advance_units, expected.0);
+        assert_eq!(advance.units_per_em, expected.1);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn named_variable_font_styles_survive_loading() {
+        use crate::font::macos::{rasterize_glyph, register_fonts_in_dir, shape_text};
+
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src/font/resources/CascadiaCode");
+        register_fonts_in_dir(&dir);
+
+        let mut masks = Vec::new();
+        for (slot, name, weight) in [
+            (Slot::Regular, "Regular", None),
+            (Slot::Bold, "Bold", None),
+            (Slot::Italic, "Italic", None),
+            (Slot::BoldItalic, "Bold Italic", None),
+            (Slot::Bold, "Bold", Some(400)),
+        ] {
+            let spec = SugarloafFont {
+                family: "Cascadia Code NF".to_string(),
+                style: FontStyle::Named(name.to_string()),
+                weight,
+            };
+            let FindResult::Found(font) = find_font(spec, slot, false) else {
+                panic!("bundled {name} face must resolve");
+            };
+            assert_eq!(font.is_bold(), slot.is_bold() && weight.is_none());
+            assert_eq!(font.is_italic(), slot.is_italic());
+            assert!(!font.should_embolden);
+            assert!(!font.should_italicize);
+
+            let handle = font.handle.as_ref().expect("CoreText handle");
+            let glyphs = shape_text(handle, "M", 24.0);
+            let mask = rasterize_glyph(handle, glyphs[0].id, 24.0, false, false, false)
+                .expect("rasterized glyph");
+            assert!(mask.bytes.iter().any(|&b| b != 0));
+            masks.push((mask.width, mask.height, mask.bytes));
+        }
+        assert_ne!(masks[0], masks[1], "regular and bold must differ");
+        assert_ne!(masks[2], masks[3], "italic and bold italic must differ");
+        assert_eq!(
+            masks[0], masks[4],
+            "explicit weight must override the style"
+        );
+    }
 
     /// `insert_alias` registers a new id that resolves back to the
     /// target's `FontData` through `get`/`try_get`. Slot 0 is owned;
@@ -1907,6 +2512,76 @@ mod alias_tests {
         assert_eq!(bold_italic.wght_variation, Some(constants::WGHT_BOLD));
         assert_eq!(regular.wght_variation, None);
         assert_eq!(italic.wght_variation, None);
+    }
+
+    /// The user-configured bold slot must win for bold cells even when
+    /// the face reports a sub-700 weight (families shipping bold at
+    /// 600, Nerd Font patches). Regression test for #1110: the
+    /// weight-based walk used to reject the slot and send bold text
+    /// to the regular face.
+    #[test]
+    fn bold_slot_wins_regardless_of_weight_metadata() {
+        use std::sync::Arc;
+
+        let mut data = FontLibraryData::default();
+        data.insert(
+            FontData::from_static_slice(constants::FONT_CASCADIA_CODE_NF)
+                .expect("load regular"),
+        );
+        data.insert(
+            FontData::from_static_slice(constants::FONT_CASCADIA_CODE_NF_ITALIC)
+                .expect("load italic"),
+        );
+        // Simulate a family whose bold face reports weight 600.
+        let bold = FontData::from_static_slice_with_wght(
+            constants::FONT_CASCADIA_CODE_NF,
+            Some(600.0),
+        )
+        .expect("load bold");
+        assert!(!bold.is_bold(), "test premise: bold face under 700");
+        data.insert(bold);
+        data.insert_alias(FONT_ID_REGULAR);
+
+        let lib = FontLibrary {
+            inner: Arc::new(parking_lot::RwLock::new(data)),
+        };
+
+        let style = crate::SpanStyle {
+            font_attrs: swash::Attributes::new(
+                swash::Stretch::NORMAL,
+                swash::Weight::BOLD,
+                swash::Style::Normal,
+            ),
+            ..Default::default()
+        };
+        let (font_id, _) = lib
+            .inner
+            .read()
+            .find_best_font_match_strict('A', &style, None)
+            .expect("cluster must resolve");
+        assert_eq!(
+            font_id, FONT_ID_BOLD,
+            "bold cells must use the configured bold slot"
+        );
+    }
+
+    #[test]
+    fn parse_font_features_forms() {
+        let entries: Vec<String> = ["ss01", "+dlig", "-liga", "cv01=2", "bogus_tag", ""]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let parsed = parse_font_features(&entries);
+        let tag = |s: &str| {
+            let mut t = [b' '; 4];
+            t[..s.len()].copy_from_slice(s.as_bytes());
+            u32::from_be_bytes(t)
+        };
+        assert_eq!(parsed.len(), 4);
+        assert_eq!((parsed[0].tag, parsed[0].value), (tag("ss01"), 1));
+        assert_eq!((parsed[1].tag, parsed[1].value), (tag("dlig"), 1));
+        assert_eq!((parsed[2].tag, parsed[2].value), (tag("liga"), 0));
+        assert_eq!((parsed[3].tag, parsed[3].value), (tag("cv01"), 2));
     }
 
     /// Aliases share the target's `metrics_cache`, so requesting

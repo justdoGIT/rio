@@ -3,7 +3,7 @@ use serde::de::{self, Deserializer, Visitor};
 use serde::{Deserialize, Serialize, Serializer};
 use std::fmt;
 
-/// Per-slot font style override. Mirrors Ghostty's `FontStyle` enum:
+/// Per-slot font style override:
 ///   - `Default`: let font discovery pick the face implied by the slot
 ///     (regular / bold / italic / bold+italic traits).
 ///   - `Disabled`: skip this slot entirely; the regular face is reused
@@ -82,6 +82,10 @@ pub struct SugarloafFont {
     pub family: String,
     #[serde(default)]
     pub style: FontStyle,
+    /// CSS-style weight (100..900). Steers face selection where the
+    /// platform supports it and pins the `wght` axis on variable fonts.
+    #[serde(default = "Option::default")]
+    pub weight: Option<u16>,
 }
 
 impl Default for SugarloafFont {
@@ -89,6 +93,7 @@ impl Default for SugarloafFont {
         Self {
             family: default_font_family(),
             style: FontStyle::Default,
+            weight: None,
         }
     }
 }
